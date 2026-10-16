@@ -3,8 +3,12 @@ package com.pessoal.leitordemanga;
 import android.app.Activity;
 import android.app.AlertDialog;
 import android.animation.LayoutTransition;
+import android.content.ClipData;
+import android.content.ContentResolver;
 import android.content.SharedPreferences;
+import android.content.Intent;
 import android.content.res.Configuration;
+import android.database.Cursor;
 import android.graphics.Bitmap;
 import android.graphics.Color;
 import android.graphics.Matrix;
@@ -12,6 +16,7 @@ import android.graphics.Rect;
 import android.graphics.pdf.PdfRenderer;
 import android.graphics.drawable.GradientDrawable;
 import android.graphics.drawable.RippleDrawable;
+import android.net.Uri;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
@@ -38,16 +43,28 @@ import android.widget.Switch;
 import android.widget.TextView;
 import android.widget.Toast;
 
+import android.provider.OpenableColumns;
+
+import org.json.JSONArray;
+import org.json.JSONException;
+import org.json.JSONObject;
+
 import java.io.File;
 import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
 import java.text.Collator;
 import java.util.ArrayList;
 import java.util.BitSet;
 import java.util.Collections;
+import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
@@ -55,6 +72,13 @@ public class MainActivity extends Activity {
     private static final String TAG = "MangaReader";
     private static final String PREFS = "manga_reader";
     private static final String ASSET_FOLDER = "manga";
+    private static final String PICKED_FILES_PREF = "picked_drive_files";
+    private static final int PICK_PDFS_REQUEST_CODE = 7142;
+    private static final int PICK_PROFILE_PHOTO_REQUEST_CODE = 7143;
+    private static final String DEFAULT_PROFILE_NAME = "Café Pilão";
+    private static final String PROFILE_NAME_PREF = "profile_name";
+    private static final String PROFILE_PHOTO_URI_PREF = "profile_photo_uri";
+    private static final String PROFILE_ACCENT_COLOR_PREF = "profile_accent_color";
     private static final float MAX_ZOOM = 5f;
     private static final int UI_ANIMATION_DURATION_MS = 220;
 
@@ -71,6 +95,7 @@ public class MainActivity extends Activity {
     private int progressTrackColor;
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
     private final ExecutorService pageRenderExecutor = Executors.newSingleThreadExecutor();
+    private final ExecutorService fileExecutor = Executors.newSingleThreadExecutor();
     private volatile PdfRenderer pdfRenderer;
     private ParcelFileDescriptor fileDescriptor;
     private ImageView pageImage;
@@ -78,12 +103,17 @@ public class MainActivity extends Activity {
     private TextView zoomLabel;
     private TextView compactPageCounter;
     private SeekBar pageSeekBar;
+    private TextView driveStatusText;
+    private Button drivePickerButton;
     private LinearLayout readerControlsContent;
     private Button readerControlsToggle;
     private ImageButton fullscreenButton;
     private Bitmap pageBitmap;
     private String currentFileName;
-    private List<String> libraryFiles = new ArrayList<>();
+    private MangaVolume currentVolume;
+    private List<MangaVolume> libraryFiles = new ArrayList<>();
+    private Map<String, MangaVolume> pickedVolumes = new HashMap<>();
+    private final Set<String> downloadingVolumeKeys = new HashSet<>();
     private BitSet readPages = new BitSet();
     private int currentPage;
     private boolean swipeDownToNext;
@@ -112,9 +142,15 @@ public class MainActivity extends Activity {
         pageBackground = getColor(R.color.reader_background);
         surfaceColor = getColor(R.color.reader_surface);
         raisedSurfaceColor = getColor(R.color.reader_surface_raised);
-        selectedSurfaceColor = getColor(R.color.reader_surface_burgundy);
-        accentColor = getColor(R.color.reader_accent);
-        brightAccentColor = getColor(R.color.reader_accent_bright);
+        boolean customAccent = preferences.contains(PROFILE_ACCENT_COLOR_PREF);
+        accentColor = preferences.getInt(
+                PROFILE_ACCENT_COLOR_PREF, getColor(R.color.reader_accent));
+        selectedSurfaceColor = customAccent
+                ? blendColor(surfaceColor, accentColor, 0.22f)
+                : getColor(R.color.reader_surface_burgundy);
+        brightAccentColor = customAccent
+                ? blendColor(accentColor, Color.WHITE, 0.18f)
+                : getColor(R.color.reader_accent_bright);
         primaryTextColor = getColor(R.color.reader_text_primary);
         secondaryTextColor = getColor(R.color.reader_text_secondary);
         dividerColor = getColor(R.color.reader_divider);
@@ -140,6 +176,7 @@ public class MainActivity extends Activity {
         pageRenderGeneration++;
         closeCurrentDocument();
         pageRenderExecutor.shutdownNow();
+        fileExecutor.shutdownNow();
         super.onDestroy();
     }
 
@@ -175,7 +212,21 @@ public class MainActivity extends Activity {
 
         ImageView avatar = new ImageView(this);
         avatar.setImageResource(R.drawable.avatar_kaneki);
-        avatar.setContentDescription("Foto de perfil de Café Pilão");
+        String profileName = preferences.getString(PROFILE_NAME_PREF, DEFAULT_PROFILE_NAME);
+        String profilePhotoUri = preferences.getString(PROFILE_PHOTO_URI_PREF, null);
+        if (profilePhotoUri != null && !profilePhotoUri.isEmpty()) {
+            try {
+                avatar.setImageURI(Uri.parse(profilePhotoUri));
+                if (avatar.getDrawable() == null) {
+                    avatar.setImageResource(R.drawable.avatar_kaneki);
+                    Log.w(TAG, "A foto de perfil salva não pôde ser carregada.");
+                }
+            } catch (SecurityException | IllegalArgumentException exception) {
+                Log.w(TAG, "Não foi possível acessar a foto de perfil salva.", exception);
+                avatar.setImageResource(R.drawable.avatar_kaneki);
+            }
+        }
+        avatar.setContentDescription("Foto de perfil de " + profileName);
         avatar.setScaleType(ImageView.ScaleType.CENTER_CROP);
         avatar.setBackground(roundBackground(accentColor, dp(40)));
         avatar.setClipToOutline(true);
@@ -184,7 +235,7 @@ public class MainActivity extends Activity {
         LinearLayout profile = new LinearLayout(this);
         profile.setOrientation(LinearLayout.VERTICAL);
         profile.setPadding(dp(12), 0, dp(4), 0);
-        TextView username = makeText("Café Pilão", 16, primaryTextColor, true);
+        TextView username = makeText(profileName, 16, primaryTextColor, true);
         TextView profileCaption = makeText("COLEÇÃO PESSOAL", 10, secondaryTextColor, true);
         LinearLayout.LayoutParams captionParams = new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
@@ -278,10 +329,38 @@ public class MainActivity extends Activity {
         awakeRow.addView(awakeSwitch);
         awakeRow.setMinimumHeight(dp(56));
         settingsPanel.addView(awakeRow);
+
+        Button customizeButton = makeButton("Personalizar perfil e cor");
+        customizeButton.setTextSize(12);
+        LinearLayout.LayoutParams customizeParams = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, dp(42));
+        customizeParams.topMargin = dp(6);
+        customizeParams.bottomMargin = dp(6);
+        settingsPanel.addView(customizeButton, customizeParams);
+        customizeButton.setOnClickListener(view -> showProfileCustomizationMenu());
+
         LinearLayout.LayoutParams settingsParams = new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
         settingsParams.bottomMargin = dp(16);
         root.addView(settingsPanel, settingsParams);
+
+        LinearLayout driveRow = new LinearLayout(this);
+        driveRow.setGravity(Gravity.CENTER_VERTICAL);
+        driveStatusText = makeText(
+                "Escolha PDFs no Google Drive ou no aparelho",
+                10, secondaryTextColor, false);
+        driveStatusText.setSingleLine(true);
+        driveStatusText.setEllipsize(android.text.TextUtils.TruncateAt.END);
+        driveRow.addView(driveStatusText, new LinearLayout.LayoutParams(
+                0, ViewGroup.LayoutParams.WRAP_CONTENT, 1));
+        drivePickerButton = makeButton("Selecionar PDFs");
+        drivePickerButton.setTextSize(11);
+        drivePickerButton.setOnClickListener(view -> openPdfPicker());
+        driveRow.addView(drivePickerButton);
+        LinearLayout.LayoutParams driveRowParams = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        driveRowParams.bottomMargin = dp(10);
+        root.addView(driveRow, driveRowParams);
 
         ScrollView scrollView = new ScrollView(this);
         scrollView.setClipToPadding(false);
@@ -293,30 +372,28 @@ public class MainActivity extends Activity {
         root.addView(scrollView, new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, 0, 1));
 
-        List<String> files;
+        List<MangaVolume> files;
         try {
-            files = listPdfAssets();
+            files = listLibraryVolumes();
             libraryFiles = files;
         } catch (IOException exception) {
-            Log.e(TAG, "Não foi possível listar os PDFs da biblioteca.", exception);
-            showMessage("Não foi possível carregar os PDFs: " + exception.getMessage());
+            Log.e(TAG, "Não foi possível carregar a biblioteca.", exception);
+            showMessage("Não foi possível carregar a biblioteca: " + exception.getMessage());
             setContentView(root);
             return;
         }
 
         if (files.isEmpty()) {
             TextView empty = makeText(
-                    "Nenhum PDF na biblioteca ainda.\n\nAdicione os volumes em:\n"
-                            + "app/src/main/assets/manga\n\n"
-                            + "Dica: use 001 - Volume 1.pdf, 002 - Volume 2.pdf…",
+                    "Nenhum volume adicionado.\n\nToque em Adicionar PDFs e escolha os mangás no Google Drive.",
                     13, secondaryTextColor, false);
             empty.setGravity(Gravity.CENTER);
             empty.setPadding(dp(28), dp(40), dp(28), dp(40));
             chapters.addView(empty);
         } else {
             for (int index = 0; index < files.size(); index++) {
-                String fileName = files.get(index);
-                chapters.addView(makeChapterCard(fileName));
+                MangaVolume volume = files.get(index);
+                chapters.addView(makeChapterCard(volume));
                 if (index < files.size() - 1) {
                     View divider = new View(this);
                     divider.setBackgroundColor(dividerColor);
@@ -334,6 +411,48 @@ public class MainActivity extends Activity {
         for (int index = 0; index < chapters.getChildCount(); index++) {
             animateEntrance(chapters.getChildAt(index), 70 + index * 35L);
         }
+    }
+
+    private List<MangaVolume> listLibraryVolumes() throws IOException {
+        Map<String, MangaVolume> volumesByKey = new HashMap<>();
+        for (String name : listPdfAssets()) {
+            MangaVolume volume = new MangaVolume(name, name, null, false, -1, true);
+            volumesByKey.put(volume.key, volume);
+        }
+
+        JSONArray savedFiles = readPickedFiles();
+        for (int index = 0; index < savedFiles.length(); index++) {
+            JSONObject file = savedFiles.optJSONObject(index);
+            if (file == null) {
+                continue;
+            }
+            String uriText = file.optString("uri", "");
+            String name = file.optString("name", "");
+            if (uriText.isEmpty() || name.isEmpty()) {
+                continue;
+            }
+            long size = file.optLong("size", -1);
+            String key = pickedFileKey(uriText);
+            MangaVolume volume = new MangaVolume(key, name, uriText, true, size, false);
+            volumesByKey.put(volume.key, volume);
+        }
+        for (MangaVolume volume : pickedVolumes.values()) {
+            volumesByKey.put(volume.key, volume);
+        }
+
+        List<MangaVolume> volumes = new ArrayList<>(volumesByKey.values());
+        Collator collator = Collator.getInstance(Locale.ROOT);
+        Collections.sort(volumes, (first, second) -> {
+            int seriesOrder = Integer.compare(
+                    seriesOrder(first.name), seriesOrder(second.name));
+            if (seriesOrder != 0) {
+                return seriesOrder;
+            }
+            int volumeOrder = Integer.compare(
+                    volumeNumber(first.name), volumeNumber(second.name));
+            return volumeOrder != 0 ? volumeOrder : collator.compare(first.name, second.name);
+        });
+        return volumes;
     }
 
     private List<String> listPdfAssets() throws IOException {
@@ -356,6 +475,41 @@ public class MainActivity extends Activity {
             return volumeOrder != 0 ? volumeOrder : collator.compare(first, second);
         });
         return files;
+    }
+
+    private JSONArray readPickedFiles() {
+        String savedFiles = preferences.getString(PICKED_FILES_PREF, "[]");
+        try {
+            return new JSONArray(savedFiles);
+        } catch (JSONException exception) {
+            Log.e(TAG, "A lista local de PDFs selecionados está inválida.", exception);
+            preferences.edit().remove(PICKED_FILES_PREF).apply();
+            showMessage("A lista local de PDFs estava inválida e foi limpa.");
+            return new JSONArray();
+        }
+    }
+
+    private void savePickedFiles(JSONArray files) {
+        preferences.edit().putString(PICKED_FILES_PREF, files.toString()).apply();
+    }
+
+    private String pickedFileKey(String uriText) {
+        try {
+            byte[] digest = MessageDigest.getInstance("SHA-256")
+                    .digest(uriText.getBytes(java.nio.charset.StandardCharsets.UTF_8));
+            StringBuilder key = new StringBuilder("picked:");
+            for (byte value : digest) {
+                key.append(String.format(Locale.ROOT, "%02x", value & 0xff));
+            }
+            return key.toString();
+        } catch (NoSuchAlgorithmException exception) {
+            throw new IllegalStateException("SHA-256 não está disponível neste Android.", exception);
+        }
+    }
+
+    private File getDownloadFile(String key) {
+        String safeName = key.replaceAll("[^A-Za-z0-9_-]", "_");
+        return new File(new File(getFilesDir(), ASSET_FOLDER), safeName + ".pdf");
     }
 
     private int seriesOrder(String fileName) {
@@ -395,7 +549,7 @@ public class MainActivity extends Activity {
         }
     }
 
-    private View makeChapterCard(String fileName) {
+    private View makeChapterCard(MangaVolume volume) {
         LinearLayout card = new LinearLayout(this);
         card.setOrientation(LinearLayout.VERTICAL);
         card.setPadding(dp(12), dp(13), dp(12), dp(13));
@@ -405,35 +559,87 @@ public class MainActivity extends Activity {
         card.setBackground(new RippleDrawable(
                 ripple, null, roundBackground(primaryTextColor, dp(10))));
 
-        int totalPages = preferences.getInt(totalKey(fileName), 0);
-        int lastPage = preferences.getInt(pageKey(fileName), 0);
-        BitSet pages = getReadPages(fileName);
+        boolean downloaded = volume.isBundled || isVolumeDownloaded(volume);
+        boolean downloading = downloadingVolumeKeys.contains(volume.key);
+        int totalPages = preferences.getInt(totalKey(volume.key), 0);
+        int lastPage = preferences.getInt(pageKey(volume.key), 0);
+        BitSet pages = getReadPages(volume.key);
         String status;
-        if (totalPages > 0 && pages.cardinality() >= totalPages) {
+        if (downloading) {
+            status = "BAIXANDO";
+        } else if (!downloaded) {
+            status = "SELECIONADO · PRONTO PARA BAIXAR";
+        } else if (totalPages > 0 && pages.cardinality() >= totalPages) {
             status = "CONCLUÍDO";
         } else if (lastPage > 0 || !pages.isEmpty()) {
             status = totalPages > 0
-                    ? "PÁG. " + (lastPage + 1) + " / " + totalPages
-                    : pages.cardinality() + " LIDA(S)";
+                    ? "OFFLINE · PÁG. " + (lastPage + 1) + " / " + totalPages
+                    : "OFFLINE · " + pages.cardinality() + " LIDA(S)";
         } else {
-            status = "NÃO INICIADO";
+            status = downloaded ? "DISPONÍVEL OFFLINE" : "PRONTO PARA BAIXAR";
         }
 
         LinearLayout titleRow = new LinearLayout(this);
         titleRow.setGravity(Gravity.CENTER_VERTICAL);
-        TextView title = makeText(displayName(fileName), 15, primaryTextColor, true);
+        TextView title = makeText(displayName(volume.name), 15, primaryTextColor, true);
         title.setSingleLine(true);
         title.setEllipsize(android.text.TextUtils.TruncateAt.END);
         titleRow.addView(title, new LinearLayout.LayoutParams(
                 0, ViewGroup.LayoutParams.WRAP_CONTENT, 1));
-        TextView statusLabel = makeText(status, 9, secondaryTextColor, true);
-        statusLabel.setLetterSpacing(0.04f);
-        statusLabel.setGravity(Gravity.CENTER_VERTICAL | Gravity.END);
-        statusLabel.setPadding(dp(8), 0, 0, 0);
-        titleRow.addView(statusLabel);
         card.addView(titleRow);
 
-        if (totalPages > 0) {
+        LinearLayout statusRow = new LinearLayout(this);
+        statusRow.setGravity(Gravity.CENTER_VERTICAL);
+        TextView statusLabel = makeText(status, 9, secondaryTextColor, true);
+        statusLabel.setLetterSpacing(0.04f);
+        statusRow.addView(statusLabel, new LinearLayout.LayoutParams(
+                0, ViewGroup.LayoutParams.WRAP_CONTENT, 1));
+        if (!volume.isBundled) {
+            Button downloadButton = makeButton(
+                    downloading ? "Baixando…" : downloaded ? "Remover" : "Baixar");
+            downloadButton.setTextSize(10);
+            downloadButton.setMinHeight(dp(34));
+            downloadButton.setMinimumHeight(dp(34));
+            downloadButton.setPadding(dp(12), 0, dp(12), 0);
+            downloadButton.setEnabled(!downloading);
+            if (downloaded) {
+                downloadButton.setTextColor(brightAccentColor);
+            }
+            downloadButton.setContentDescription(downloading
+                    ? "Baixando " + displayName(volume.name)
+                    : downloaded
+                    ? "Remover " + displayName(volume.name)
+                            + " deste aparelho, sem apagar o original"
+                    : "Baixar " + displayName(volume.name) + " para este aparelho");
+            downloadButton.setOnClickListener(view -> {
+                if (isVolumeDownloaded(volume)) {
+                    confirmRemoveDownloadedVolume(volume);
+                } else {
+                    downloadSelectedVolume(volume, false);
+                }
+            });
+            statusRow.addView(downloadButton);
+        }
+        LinearLayout.LayoutParams statusRowParams = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        statusRowParams.topMargin = dp(5);
+        card.addView(statusRow, statusRowParams);
+
+        if (downloading) {
+            ProgressBar downloadProgressBar = new ProgressBar(
+                    this, null, android.R.attr.progressBarStyleHorizontal);
+            downloadProgressBar.setIndeterminate(true);
+            downloadProgressBar.setProgressTintList(
+                    android.content.res.ColorStateList.valueOf(brightAccentColor));
+            downloadProgressBar.setProgressBackgroundTintList(
+                    android.content.res.ColorStateList.valueOf(progressTrackColor));
+            LinearLayout.LayoutParams downloadProgressParams = new LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT, dp(4));
+            downloadProgressParams.topMargin = dp(10);
+            card.addView(downloadProgressBar, downloadProgressParams);
+        }
+
+        if (downloaded && totalPages > 0) {
             ProgressBar progressBar = new ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal);
             progressBar.setMax(100);
             progressBar.setProgress(Math.min(100, pages.cardinality() * 100 / totalPages));
@@ -447,13 +653,16 @@ public class MainActivity extends Activity {
         }
 
         card.setOnClickListener(view -> {
+            if (downloadingVolumeKeys.contains(volume.key)) {
+                return;
+            }
             view.animate()
                     .scaleX(0.98f)
                     .scaleY(0.98f)
                     .setDuration(75)
                     .withEndAction(() -> {
                         view.animate().scaleX(1f).scaleY(1f).setDuration(110).start();
-                        openPdf(fileName);
+                        openVolume(volume);
                     })
                     .start();
         });
@@ -464,13 +673,82 @@ public class MainActivity extends Activity {
         return card;
     }
 
-    private void openPdf(String fileName) {
+    private void confirmRemoveDownloadedVolume(MangaVolume volume) {
+        new AlertDialog.Builder(this)
+                .setTitle("Remover download?")
+                .setMessage(displayName(volume.name)
+                        + " será removido deste app e aparelho. O arquivo original na origem "
+                        + "(por exemplo, no Google Drive) não será apagado. "
+                        + "O progresso de leitura será mantido.")
+                .setNegativeButton("Cancelar", null)
+                .setPositiveButton("Remover", (dialog, which) -> {
+                    File cachedFile = getDownloadFile(volume.key);
+                    if (cachedFile.exists() && !cachedFile.delete()) {
+                        showMessage("Não foi possível remover o arquivo local.");
+                        return;
+                    }
+                    removeSelectedVolume(volume);
+                    showMessage("Mangá removido do app. O arquivo original não foi alterado.");
+                    showLibrary();
+                })
+                .show();
+    }
+
+    private void removeSelectedVolume(MangaVolume volume) {
+        JSONArray savedFiles = readPickedFiles();
+        JSONArray retainedFiles = new JSONArray();
+        for (int index = 0; index < savedFiles.length(); index++) {
+            JSONObject file = savedFiles.optJSONObject(index);
+            if (file == null || !volume.sourceUri.equals(file.optString("uri", ""))) {
+                if (file != null) {
+                    retainedFiles.put(file);
+                }
+            }
+        }
+        savePickedFiles(retainedFiles);
+        pickedVolumes.remove(volume.key);
+        try {
+            getContentResolver().releasePersistableUriPermission(
+                    Uri.parse(volume.sourceUri), Intent.FLAG_GRANT_READ_URI_PERMISSION);
+        } catch (SecurityException | IllegalArgumentException exception) {
+            Log.w(TAG, "Não foi possível liberar a permissão salva para "
+                    + volume.name, exception);
+        }
+    }
+
+    private boolean isVolumeDownloaded(MangaVolume volume) {
+        return volume.isBundled
+                || (volume.sourceUri != null && getDownloadFile(volume.key).isFile());
+    }
+
+    private void openVolume(MangaVolume volume) {
+        if (volume.isBundled) {
+            try {
+                openPdfFile(volume, copyAssetToPrivateStorage(volume.name));
+            } catch (IOException exception) {
+                Log.e(TAG, "Não foi possível preparar " + volume.name, exception);
+                showMessage("Não foi possível abrir o PDF: " + exception.getMessage());
+            }
+            return;
+        }
+
+        File cachedFile = getDownloadFile(volume.key);
+        if (cachedFile.isFile()) {
+            openPdfFile(volume, cachedFile);
+        } else if (volume.availableFromSource) {
+            downloadSelectedVolume(volume, true);
+        } else {
+            showMessage("Este volume não está baixado. Selecione-o novamente na origem.");
+        }
+    }
+
+    private void openPdfFile(MangaVolume volume, File pdfFile) {
         closeCurrentDocument();
         try {
-            File pdfFile = copyAssetToPrivateStorage(fileName);
             fileDescriptor = ParcelFileDescriptor.open(pdfFile, ParcelFileDescriptor.MODE_READ_ONLY);
             pdfRenderer = new PdfRenderer(fileDescriptor);
-            currentFileName = fileName;
+            currentVolume = volume;
+            currentFileName = volume.key;
             int pageCount = pdfRenderer.getPageCount();
             if (pageCount <= 0) {
                 closeCurrentDocument();
@@ -479,20 +757,538 @@ public class MainActivity extends Activity {
                 return;
             }
 
-            preferences.edit().putInt(totalKey(fileName), pageCount).apply();
-            readPages = getReadPages(fileName);
+            preferences.edit().putInt(totalKey(volume.key), pageCount).apply();
+            readPages = getReadPages(volume.key);
             if (readPages.length() > pageCount) {
                 readPages.clear(pageCount, readPages.length());
             }
-            currentPage = Math.max(0, Math.min(pageCount - 1, preferences.getInt(pageKey(fileName), 0)));
+            currentPage = Math.max(0, Math.min(
+                    pageCount - 1, preferences.getInt(pageKey(volume.key), 0)));
             showReader();
             setCurrentPage(currentPage);
         } catch (IOException exception) {
             closeCurrentDocument();
-            Log.e(TAG, "Não foi possível abrir " + fileName, exception);
+            Log.e(TAG, "Não foi possível abrir " + volume.name, exception);
             showMessage("Não foi possível abrir o PDF: " + exception.getMessage());
             showLibrary();
         }
+    }
+
+    private void openPdfPicker() {
+        Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT);
+        intent.addCategory(Intent.CATEGORY_OPENABLE);
+        intent.setType("application/pdf");
+        intent.putExtra(Intent.EXTRA_ALLOW_MULTIPLE, true);
+        intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION
+                | Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION);
+        try {
+            startActivityForResult(intent, PICK_PDFS_REQUEST_CODE);
+        } catch (android.content.ActivityNotFoundException exception) {
+            Log.e(TAG, "Não há um seletor de arquivos disponível no aparelho.", exception);
+            showMessage("Não foi possível abrir o seletor de arquivos deste aparelho.");
+        }
+    }
+
+    private void showProfileCustomizationMenu() {
+        String[] options = {
+                "Alterar nome",
+                "Alterar foto de perfil",
+                "Alterar cor de destaque",
+                "Voltar ao padrão"
+        };
+        new AlertDialog.Builder(this)
+                .setTitle("Personalização")
+                .setItems(options, (dialog, which) -> {
+                    if (which == 0) {
+                        showEditProfileNameDialog();
+                    } else if (which == 1) {
+                        openProfilePhotoPicker();
+                    } else if (which == 2) {
+                        showAccentColorDialog();
+                    } else if (which == 3) {
+                        confirmRestoreProfileDefaults();
+                    }
+                })
+                .show();
+    }
+
+    private void showEditProfileNameDialog() {
+        EditText nameInput = new EditText(this);
+        nameInput.setSingleLine(true);
+        nameInput.setInputType(InputType.TYPE_CLASS_TEXT
+                | InputType.TYPE_TEXT_FLAG_CAP_SENTENCES);
+        nameInput.setText(preferences.getString(PROFILE_NAME_PREF, DEFAULT_PROFILE_NAME));
+        nameInput.setSelection(nameInput.getText().length());
+        nameInput.setPadding(dp(14), dp(10), dp(14), dp(10));
+
+        AlertDialog dialog = new AlertDialog.Builder(this)
+                .setTitle("Nome exibido")
+                .setView(nameInput)
+                .setNegativeButton("Cancelar", null)
+                .setPositiveButton("Salvar", null)
+                .create();
+        dialog.setOnShowListener(ignored -> dialog.getButton(AlertDialog.BUTTON_POSITIVE)
+                .setOnClickListener(view -> {
+                    String name = nameInput.getText().toString().trim();
+                    if (name.isEmpty()) {
+                        nameInput.setError("Digite um nome.");
+                        return;
+                    }
+                    preferences.edit().putString(PROFILE_NAME_PREF, name).apply();
+                    dialog.dismiss();
+                    showLibrary();
+                }));
+        dialog.show();
+    }
+
+    private void openProfilePhotoPicker() {
+        Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT);
+        intent.addCategory(Intent.CATEGORY_OPENABLE);
+        intent.setType("image/*");
+        intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION
+                | Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION);
+        try {
+            startActivityForResult(intent, PICK_PROFILE_PHOTO_REQUEST_CODE);
+        } catch (android.content.ActivityNotFoundException exception) {
+            Log.e(TAG, "Não há um seletor de imagens disponível no aparelho.", exception);
+            showMessage("Não foi possível abrir o seletor de imagens deste aparelho.");
+        }
+    }
+
+    private void showAccentColorDialog() {
+        int initialColor = preferences.getInt(
+                PROFILE_ACCENT_COLOR_PREF, getColor(R.color.reader_accent));
+        int[] components = {
+                Color.red(initialColor),
+                Color.green(initialColor),
+                Color.blue(initialColor)
+        };
+        String[] channelNames = {"Vermelho", "Verde", "Azul"};
+        TextView preview = makeText("", 14, Color.WHITE, true);
+        preview.setGravity(Gravity.CENTER);
+        preview.setPadding(dp(12), dp(10), dp(12), dp(10));
+
+        LinearLayout content = new LinearLayout(this);
+        content.setOrientation(LinearLayout.VERTICAL);
+        content.setPadding(dp(22), dp(4), dp(22), dp(8));
+        content.addView(preview, new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, dp(44)));
+
+        for (int channel = 0; channel < components.length; channel++) {
+            final int channelIndex = channel;
+            LinearLayout row = new LinearLayout(this);
+            row.setGravity(Gravity.CENTER_VERTICAL);
+            TextView label = makeText(channelNames[channel], 11, primaryTextColor, false);
+            row.addView(label, new LinearLayout.LayoutParams(dp(66), dp(44)));
+            SeekBar seekBar = new SeekBar(this);
+            seekBar.setMax(255);
+            seekBar.setProgress(components[channel]);
+            seekBar.setProgressTintList(
+                    android.content.res.ColorStateList.valueOf(brightAccentColor));
+            seekBar.setThumbTintList(
+                    android.content.res.ColorStateList.valueOf(brightAccentColor));
+            row.addView(seekBar, new LinearLayout.LayoutParams(
+                    0, dp(44), 1));
+            content.addView(row);
+            seekBar.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
+                @Override
+                public void onProgressChanged(SeekBar bar, int progress, boolean fromUser) {
+                    components[channelIndex] = progress;
+                    updateAccentColorPreview(preview, components);
+                }
+
+                @Override
+                public void onStartTrackingTouch(SeekBar bar) {
+                }
+
+                @Override
+                public void onStopTrackingTouch(SeekBar bar) {
+                }
+            });
+        }
+        updateAccentColorPreview(preview, components);
+
+        AlertDialog dialog = new AlertDialog.Builder(this)
+                .setTitle("Cor de destaque")
+                .setView(content)
+                .setNegativeButton("Cancelar", null)
+                .setPositiveButton("Aplicar", (dialogInterface, which) -> {
+                    int chosenColor = Color.rgb(
+                            components[0], components[1], components[2]);
+                    preferences.edit()
+                            .putInt(PROFILE_ACCENT_COLOR_PREF, chosenColor)
+                            .apply();
+                    loadDesignTokens();
+                    showLibrary();
+                })
+                .create();
+        dialog.show();
+    }
+
+    private void updateAccentColorPreview(TextView preview, int[] components) {
+        int color = Color.rgb(components[0], components[1], components[2]);
+        preview.setText(String.format(Locale.ROOT, "#%06X", color & 0xFFFFFF));
+        preview.setBackground(roundBackground(color, dp(10)));
+    }
+
+    private void confirmRestoreProfileDefaults() {
+        new AlertDialog.Builder(this)
+                .setTitle("Voltar ao padrão?")
+                .setMessage("O nome, a foto de perfil e a cor voltarão aos valores originais. "
+                        + "Seu progresso e suas preferências de leitura serão mantidos.")
+                .setNegativeButton("Cancelar", null)
+                .setPositiveButton("Restaurar", (dialog, which) -> {
+                    String photoUri = preferences.getString(PROFILE_PHOTO_URI_PREF, null);
+                    if (photoUri != null) {
+                        releaseProfilePhotoPermission(photoUri);
+                    }
+                    preferences.edit()
+                            .remove(PROFILE_NAME_PREF)
+                            .remove(PROFILE_PHOTO_URI_PREF)
+                            .remove(PROFILE_ACCENT_COLOR_PREF)
+                            .apply();
+                    loadDesignTokens();
+                    showLibrary();
+                })
+                .show();
+    }
+
+    private void releaseProfilePhotoPermission(String uriText) {
+        try {
+            getContentResolver().releasePersistableUriPermission(
+                    Uri.parse(uriText), Intent.FLAG_GRANT_READ_URI_PERMISSION);
+        } catch (SecurityException | IllegalArgumentException exception) {
+            Log.w(TAG, "Não foi possível liberar o acesso persistente à foto de perfil.", exception);
+        }
+    }
+
+    private int blendColor(int from, int to, float ratio) {
+        float inverseRatio = 1f - ratio;
+        return Color.rgb(
+                Math.round(Color.red(from) * inverseRatio + Color.red(to) * ratio),
+                Math.round(Color.green(from) * inverseRatio + Color.green(to) * ratio),
+                Math.round(Color.blue(from) * inverseRatio + Color.blue(to) * ratio));
+    }
+
+    @Override
+    protected void onActivityResult(int requestCode, int resultCode, Intent data) {
+        super.onActivityResult(requestCode, resultCode, data);
+        if (requestCode == PICK_PROFILE_PHOTO_REQUEST_CODE) {
+            handleProfilePhotoResult(resultCode, data);
+            return;
+        }
+        if (requestCode != PICK_PDFS_REQUEST_CODE) {
+            return;
+        }
+        if (resultCode != RESULT_OK || data == null) {
+            return;
+        }
+
+        List<Uri> selectedUris = new ArrayList<>();
+        ClipData clipData = data.getClipData();
+        if (clipData != null) {
+            for (int index = 0; index < clipData.getItemCount(); index++) {
+                Uri uri = clipData.getItemAt(index).getUri();
+                if (uri != null) {
+                    selectedUris.add(uri);
+                }
+            }
+        } else if (data.getData() != null) {
+            selectedUris.add(data.getData());
+        }
+        if (selectedUris.isEmpty()) {
+            showMessage("O seletor não retornou arquivos. Tente selecionar os PDFs novamente.");
+            return;
+        }
+
+        JSONArray savedFiles = readPickedFiles();
+        Set<String> knownUris = new HashSet<>();
+        for (int index = 0; index < savedFiles.length(); index++) {
+            JSONObject file = savedFiles.optJSONObject(index);
+            if (file != null) {
+                knownUris.add(file.optString("uri", ""));
+            }
+        }
+        int addedCount = 0;
+        ContentResolver resolver = getContentResolver();
+        for (Uri uri : selectedUris) {
+            if (!"content".equals(uri.getScheme())) {
+                continue;
+            }
+            try {
+                int resultFlags = data.getFlags()
+                        & (Intent.FLAG_GRANT_READ_URI_PERMISSION
+                        | Intent.FLAG_GRANT_WRITE_URI_PERMISSION);
+                if ((resultFlags & Intent.FLAG_GRANT_READ_URI_PERMISSION) != 0) {
+                    resolver.takePersistableUriPermission(
+                            uri, Intent.FLAG_GRANT_READ_URI_PERMISSION);
+                }
+            } catch (SecurityException | IllegalArgumentException exception) {
+                Log.w(TAG, "O provedor não permitiu guardar acesso permanente a " + uri, exception);
+            }
+
+            String uriText = uri.toString();
+            if (knownUris.contains(uriText)) {
+                continue;
+            }
+            try {
+                String name = queryDisplayName(uri);
+                if (name == null || !name.toLowerCase(Locale.ROOT).endsWith(".pdf")) {
+                    showMessage("Um arquivo selecionado não parece ser um PDF: "
+                            + (name == null ? "arquivo sem nome" : name));
+                    continue;
+                }
+                JSONObject file = new JSONObject();
+                file.put("uri", uriText);
+                file.put("name", name);
+                file.put("size", queryFileSize(uri));
+                savedFiles.put(file);
+                knownUris.add(uriText);
+                addedCount++;
+            } catch (IOException | JSONException exception) {
+                Log.e(TAG, "Não foi possível adicionar o PDF selecionado " + uri, exception);
+                showMessage("Não foi possível adicionar um PDF: " + exception.getMessage());
+            }
+        }
+        savePickedFiles(savedFiles);
+        loadPickedLibrary(savedFiles, addedCount);
+    }
+
+    private void handleProfilePhotoResult(int resultCode, Intent data) {
+        if (resultCode != RESULT_OK || data == null || data.getData() == null) {
+            return;
+        }
+        Uri selectedPhoto = data.getData();
+        int grantedFlags = data.getFlags() & Intent.FLAG_GRANT_READ_URI_PERMISSION;
+        if (grantedFlags == 0) {
+            showMessage("O seletor não concedeu acesso permanente à imagem. Escolha outra foto.");
+            return;
+        }
+        try {
+            getContentResolver().takePersistableUriPermission(selectedPhoto, grantedFlags);
+        } catch (SecurityException | IllegalArgumentException exception) {
+            Log.e(TAG, "Não foi possível salvar o acesso à foto de perfil.", exception);
+            showMessage("Não foi possível guardar acesso a esta foto. "
+                    + "Escolha uma imagem de Arquivos ou Galeria.");
+            return;
+        }
+
+        String previousPhoto = preferences.getString(PROFILE_PHOTO_URI_PREF, null);
+        preferences.edit()
+                .putString(PROFILE_PHOTO_URI_PREF, selectedPhoto.toString())
+                .apply();
+        if (previousPhoto != null && !previousPhoto.equals(selectedPhoto.toString())) {
+            releaseProfilePhotoPermission(previousPhoto);
+        }
+        showLibrary();
+    }
+
+    private String queryDisplayName(Uri uri) throws IOException {
+        try (Cursor cursor = getContentResolver().query(
+                uri, new String[]{OpenableColumns.DISPLAY_NAME}, null, null, null)) {
+            if (cursor != null && cursor.moveToFirst()) {
+                int nameColumn = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME);
+                if (nameColumn >= 0) {
+                    return cursor.getString(nameColumn);
+                }
+            }
+        } catch (RuntimeException exception) {
+            throw new IOException("Não foi possível ler o nome do arquivo selecionado.", exception);
+        }
+        return null;
+    }
+
+    private long queryFileSize(Uri uri) {
+        try (Cursor cursor = getContentResolver().query(
+                uri, new String[]{OpenableColumns.SIZE}, null, null, null)) {
+            if (cursor != null && cursor.moveToFirst()) {
+                int sizeColumn = cursor.getColumnIndex(OpenableColumns.SIZE);
+                if (sizeColumn >= 0 && !cursor.isNull(sizeColumn)) {
+                    return cursor.getLong(sizeColumn);
+                }
+            }
+        } catch (RuntimeException exception) {
+            Log.w(TAG, "O provedor não informou o tamanho de " + uri, exception);
+        }
+        return -1;
+    }
+
+    private void loadPickedLibrary(JSONArray files, int newlyAddedCount) {
+        Map<String, MangaVolume> loadedVolumes = new HashMap<>();
+        int selectedCount = 0;
+        for (int index = 0; index < files.length(); index++) {
+            JSONObject file = files.optJSONObject(index);
+            if (file == null) {
+                continue;
+            }
+            String uriText = file.optString("uri", "");
+            String name = file.optString("name", "");
+            if (uriText.isEmpty() || name.isEmpty()) {
+                continue;
+            }
+            String key = pickedFileKey(uriText);
+            MangaVolume volume = new MangaVolume(
+                    key, name, uriText, true, file.optLong("size", -1), false);
+            loadedVolumes.put(key, volume);
+            selectedCount++;
+        }
+        pickedVolumes = loadedVolumes;
+        showLibrary();
+        if (driveStatusText != null) {
+            driveStatusText.setText(selectedCount == 1
+                    ? "1 PDF selecionado"
+                    : selectedCount + " PDFs selecionados");
+        }
+        if (newlyAddedCount > 0) {
+            showMessage(newlyAddedCount + (newlyAddedCount == 1
+                    ? " PDF adicionado à biblioteca."
+                    : " PDFs adicionados à biblioteca."));
+        } else {
+            showMessage("Os PDFs selecionados já estão na biblioteca.");
+        }
+    }
+
+    private void downloadSelectedVolume(MangaVolume volume, boolean openAfterDownload) {
+        if (!downloadingVolumeKeys.add(volume.key)) {
+            return;
+        }
+        if (!openAfterDownload) {
+            showLibrary();
+        }
+        setPickerUiBusy(true, "Baixando " + displayName(volume.name) + "…");
+        File destination = getDownloadFile(volume.key);
+        fileExecutor.execute(() -> {
+            long[] lastUpdate = {0};
+            try {
+                copySelectedPdf(volume, destination, (copiedBytes, totalBytes) -> {
+                    long now = System.currentTimeMillis();
+                    if (now - lastUpdate[0] < 400
+                            && (totalBytes < 0 || copiedBytes < totalBytes)) {
+                        return;
+                    }
+                    lastUpdate[0] = now;
+                    String progress = totalBytes > 0
+                            ? "Baixando " + displayName(volume.name) + " · "
+                                    + (copiedBytes * 100 / totalBytes) + "%"
+                            : "Baixando " + displayName(volume.name) + " · "
+                                    + formatFileSize(copiedBytes);
+                    mainHandler.post(() -> setPickerUiBusy(true, progress));
+                });
+                mainHandler.post(() -> {
+                    downloadingVolumeKeys.remove(volume.key);
+                    setPickerUiBusy(false, displayName(volume.name) + " disponível offline");
+                    if (openAfterDownload) {
+                        openPdfFile(volume, destination);
+                    } else {
+                        showLibrary();
+                        setPickerUiBusy(false,
+                                displayName(volume.name) + " disponível offline");
+                        if (driveStatusText != null) {
+                            driveStatusText.setText(displayName(volume.name)
+                                    + " baixado para leitura offline");
+                        }
+                        showMessage(displayName(volume.name)
+                                + " foi baixado para este aparelho.");
+                    }
+                });
+            } catch (IOException exception) {
+                Log.e(TAG, "Não foi possível copiar o PDF selecionado " + volume.name, exception);
+                mainHandler.post(() -> {
+                    downloadingVolumeKeys.remove(volume.key);
+                    if (!openAfterDownload) {
+                        showLibrary();
+                    }
+                    showPickerError(
+                            "Não foi possível baixar o PDF. Selecione-o novamente e tente outra vez: "
+                                    + exception.getMessage());
+                });
+            }
+        });
+    }
+
+    private void copySelectedPdf(
+            MangaVolume volume,
+            File destination,
+            CopyProgress progress
+    ) throws IOException {
+        if (volume.sourceUri == null) {
+            throw new IOException("O arquivo selecionado não tem uma origem disponível.");
+        }
+        Uri sourceUri = Uri.parse(volume.sourceUri);
+        File directory = destination.getParentFile();
+        if (directory == null || (!directory.isDirectory() && !directory.mkdirs())) {
+            throw new IOException("Não foi possível criar a pasta local dos PDFs.");
+        }
+        File temporaryFile = new File(directory, destination.getName() + ".download");
+        boolean completed = false;
+        IOException copyFailure = null;
+        try {
+            long totalBytes = volume.size;
+            long copiedBytes = 0;
+            byte[] buffer = new byte[64 * 1024];
+            try (InputStream input = getContentResolver().openInputStream(sourceUri)) {
+                if (input == null) {
+                    throw new IOException("A origem não abriu o PDF.");
+                }
+                try (FileOutputStream output = new FileOutputStream(temporaryFile)) {
+                    int bytesRead;
+                    while ((bytesRead = input.read(buffer)) != -1) {
+                        output.write(buffer, 0, bytesRead);
+                        copiedBytes += bytesRead;
+                        progress.onProgress(copiedBytes, totalBytes);
+                    }
+                }
+            }
+            if (temporaryFile.length() == 0) {
+                throw new IOException("O PDF recebido está vazio.");
+            }
+            if (destination.exists() && !destination.delete()) {
+                throw new IOException("Não foi possível substituir a cópia local do PDF.");
+            }
+            if (!temporaryFile.renameTo(destination)) {
+                throw new IOException("Não foi possível guardar o PDF no aparelho.");
+            }
+            completed = true;
+        } catch (IOException exception) {
+            copyFailure = exception;
+            throw exception;
+        } finally {
+            if (!completed && temporaryFile.exists() && !temporaryFile.delete()) {
+                IOException cleanupFailure = new IOException(
+                        "O download falhou e o arquivo temporário não pôde ser removido.");
+                if (copyFailure != null) {
+                    copyFailure.addSuppressed(cleanupFailure);
+                } else {
+                    throw cleanupFailure;
+                }
+            }
+        }
+    }
+
+    private String formatFileSize(long bytes) {
+        if (bytes < 1024 * 1024) {
+            return Math.max(1, bytes / 1024) + " KB";
+        }
+        return String.format(Locale.ROOT, "%.1f MB", bytes / (1024f * 1024f));
+    }
+
+    private void setPickerUiBusy(boolean busy, String status) {
+        if (driveStatusText != null) {
+            driveStatusText.setText(status);
+        }
+        if (drivePickerButton != null) {
+            drivePickerButton.setEnabled(!busy);
+            drivePickerButton.setAlpha(busy ? 0.55f : 1f);
+        }
+    }
+
+    private void showPickerError(String message) {
+        setPickerUiBusy(false, "Não foi possível acessar o PDF");
+        showMessage(message);
+    }
+
+    private interface CopyProgress {
+        void onProgress(long copiedBytes, long totalBytes);
     }
 
     private File copyAssetToPrivateStorage(String fileName) throws IOException {
@@ -552,7 +1348,8 @@ public class MainActivity extends Activity {
         backButton.setOnClickListener(view -> onBackPressed());
         toolbar.addView(backButton, new LinearLayout.LayoutParams(dp(44), dp(44)));
 
-        TextView chapterTitle = makeText(displayName(currentFileName), 14, primaryTextColor, true);
+        TextView chapterTitle = makeText(
+                displayName(currentVolume.name), 14, primaryTextColor, true);
         chapterTitle.setMaxLines(1);
         chapterTitle.setEllipsize(android.text.TextUtils.TruncateAt.END);
         chapterTitle.setPadding(dp(10), 0, dp(6), 0);
@@ -925,16 +1722,22 @@ public class MainActivity extends Activity {
     }
 
     private void moveVolume(int offset) {
-        if (currentFileName == null || libraryFiles.isEmpty()) {
+        if (currentVolume == null || libraryFiles.isEmpty()) {
             return;
         }
-        int currentIndex = libraryFiles.indexOf(currentFileName);
+        int currentIndex = -1;
+        for (int index = 0; index < libraryFiles.size(); index++) {
+            if (libraryFiles.get(index).key.equals(currentVolume.key)) {
+                currentIndex = index;
+                break;
+            }
+        }
         int targetIndex = currentIndex + offset;
-        if (targetIndex < 0 || targetIndex >= libraryFiles.size()) {
+        if (currentIndex < 0 || targetIndex < 0 || targetIndex >= libraryFiles.size()) {
             showMessage(offset > 0 ? "Você chegou ao último mangá." : "Este já é o primeiro mangá.");
             return;
         }
-        openPdf(libraryFiles.get(targetIndex));
+        openVolume(libraryFiles.get(targetIndex));
     }
 
     private void showJumpToPageDialog() {
@@ -1154,7 +1957,7 @@ public class MainActivity extends Activity {
             return BitSet.valueOf(Base64.decode(encoded, Base64.NO_WRAP));
         } catch (IllegalArgumentException exception) {
             Log.e(TAG, "O progresso salvo está corrompido para " + fileName, exception);
-            showMessage("O progresso de " + displayName(fileName) + " estava inválido e foi reiniciado.");
+            showMessage("O progresso salvo deste volume estava inválido e foi reiniciado.");
             preferences.edit().remove(readKey(fileName)).apply();
             return new BitSet();
         }
@@ -1184,6 +1987,7 @@ public class MainActivity extends Activity {
         }
         pageImage = null;
         currentFileName = null;
+        currentVolume = null;
     }
 
     private String displayName(String fileName) {
@@ -1310,5 +2114,30 @@ public class MainActivity extends Activity {
 
     private void showMessage(String message) {
         Toast.makeText(this, message, Toast.LENGTH_LONG).show();
+    }
+
+    private static final class MangaVolume {
+        final String key;
+        final String name;
+        final String sourceUri;
+        final boolean availableFromSource;
+        final long size;
+        final boolean isBundled;
+
+        MangaVolume(
+                String key,
+                String name,
+                String sourceUri,
+                boolean availableFromSource,
+                long size,
+                boolean isBundled
+        ) {
+            this.key = key;
+            this.name = name;
+            this.sourceUri = sourceUri;
+            this.availableFromSource = availableFromSource;
+            this.size = size;
+            this.isBundled = isBundled;
+        }
     }
 }

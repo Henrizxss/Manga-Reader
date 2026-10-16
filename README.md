@@ -1,33 +1,25 @@
 # Leitor de Mangá
 
-Leitor Android offline para PDFs. O progresso de cada arquivo e a direção de leitura são guardados nas preferências locais do app; não há conta, servidor ou banco de dados.
+Leitor Android para PDFs locais ou selecionados no Google Drive. O progresso e as preferências são guardados no aparelho; não há backend, banco de dados ou configuração OAuth.
 
-## Adicionar os PDFs
+## Usar PDFs do Google Drive
 
-Copie os arquivos PDF para `app/src/main/assets/manga/`. Cada PDF aparece como um volume na biblioteca. Para que a ordem seja previsível, numere os arquivos com zeros à esquerda, por exemplo:
+Toque em **Adicionar PDFs** e use o seletor de arquivos do Android. Navegue até **Google Drive**, entre na sua conta caso seja solicitado, abra `Mangás` e selecione um ou vários PDFs (também pode selecionar PDFs em subpastas). Não é necessário criar um projeto no Google Cloud ou configurar OAuth; o app recebe acesso apenas aos arquivos escolhidos.
 
-```text
-app/src/main/assets/manga/
-  001 - Volume 1.pdf
-  002 - Volume 2.pdf
-  003 - Volume 3.pdf
-```
-
-Os PDFs serão incluídos no APK. O tamanho do APK aumentará de acordo com o tamanho total dos arquivos. Para trocar ou acrescentar volumes, adicione os PDFs à pasta e gere um APK novo.
-
-Os nomes atuais dos arquivos são reconhecidos automaticamente: a biblioteca mostra **Tokyo Ghoul, volumes 1–14**, seguido de **Tokyo Ghoul:re, volumes 1–16**. Os números dos volumes são ordenados numericamente; não é necessário renomear esses PDFs.
+Os arquivos selecionados aparecem na biblioteca. **Baixar** guarda uma cópia no armazenamento privado do app para leitura offline; durante a cópia, o cartão do volume mostra uma barra de carregamento e o percentual. Tocar em um volume ainda não baixado inicia a cópia e abre o leitor quando termina. **Remover** tira o volume da biblioteca e apaga a cópia local, mas nunca exclui o arquivo do Drive. O progresso de leitura fica salvo no aparelho e é mantido ao remover e adicionar novamente o mesmo arquivo. Se a origem deixar de estar acessível, selecione o PDF novamente no Drive.
 
 ## Gerar e instalar o APK
 
 1. Instale o Android Studio e, no SDK Manager, instale Android SDK Platform 35. O build requer JDK 17; o Android Studio inclui um JDK apropriado.
-2. Copie os PDFs para `app/src/main/assets/manga/` e abra esta pasta no Android Studio. Aguarde a sincronização do Gradle.
+2. Abra esta pasta no Android Studio. Aguarde a sincronização do Gradle.
 3. Selecione **Build > Build Bundle(s) / APK(s) > Build APK(s)**. Alternativamente, no PowerShell nesta pasta, execute `.\gradlew.bat assembleDebug --max-workers=2`.
 4. O APK de depuração será criado em `app/build/outputs/apk/debug/app-debug.apk`. Transfira-o para o celular, abra o arquivo e permita a instalação quando solicitado.
 
-Para testar no emulador sem empacotar os PDFs inteiros da coleção, selecione um único volume, por exemplo: `.\gradlew.bat installDebug --max-workers=2 "-PpreviewPdf=Tokyo Ghoul Volume 1 - PDF Room.pdf"`. O APK de pré-visualização conterá somente esse volume; um build normal, sem `previewPdf`, continua incluindo todos os PDFs.
+Para instalar o app sem empacotar PDFs, execute `.\gradlew.bat installDebug --max-workers=2`. Uma prévia ainda pode incluir um único volume usando `.\gradlew.bat installDebug --max-workers=2 "-PpreviewPdf=Tokyo Ghoul Volume 1 - PDF Room.pdf"`.
 
 ## Leitura
 
+- Em **Personalizar perfil e cor**, altere o nome exibido, escolha uma foto e ajuste livremente a cor de destaque pelos canais RGB. **Voltar ao padrão** restaura o perfil Café Pilão, a imagem original e a cor vermelha sem alterar o progresso ou as preferências de leitura. Essas personalizações ficam salvas localmente no aparelho.
 - Toque em um volume para abrir a última página visitada.
 - Deslize ou toque nas laterais da página, use os botões ou arraste o controle para mudar de página. As páginas são renderizadas em segundo plano e aparecem com uma transição suave. No fim do volume, o leitor oferece o próximo PDF automaticamente.
 - Aproxime dois dedos para ampliar, arraste para mover a página ampliada, toque duas vezes para alternar o zoom e use **Ajustar** para voltar à página inteira.
@@ -37,6 +29,6 @@ Para testar no emulador sem empacotar os PDFs inteiros da coleção, selecione u
 - A biblioteca, os volumes e os botões entram com animações discretas; os cartões têm feedback tátil visual ao serem abertos.
 - Ative **Manter tela ligada durante a leitura** na biblioteca para evitar que o celular bloqueie enquanto você lê.
 - Cada página aberta é marcada como lida, e a biblioteca mostra o progresso do volume.
-- Use o botão no topo da biblioteca para alternar a direção de leitura.
+- Em **Gesto para avançar**, escolha deslizar da direita para a esquerda ou arrastar para baixo.
 - Use **Zerar** dentro de um volume para apagar o progresso daquele volume.
-- A tela inicial exibe o perfil local mockado **café pilao** e a imagem de perfil fornecida; não existe autenticação.
+- A tela inicial usa por padrão o perfil local **Café Pilão** e a imagem de perfil fornecida; nome, foto e cor de destaque podem ser personalizados na biblioteca. O acesso ao Drive passa pelo seletor oficial de arquivos do Android.

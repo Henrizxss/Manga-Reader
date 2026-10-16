@@ -36,6 +36,8 @@ android {
         sourceSets.getByName("main").assets.setSrcDirs(
             listOf(previewAssetsDirectory.get().asFile)
         )
+    } else {
+        sourceSets.getByName("main").assets.setSrcDirs(emptyList<Any>())
     }
 }
 
